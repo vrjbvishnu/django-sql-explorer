@@ -3,12 +3,23 @@ from time import time
 import six
 
 from django.db import models, DatabaseError
-from django.core.urlresolvers import reverse
+try:
+    from django.urls import reverse
+except ImportError:
+    from django.core.urlresolvers import reverse
+
 from django.conf import settings
 
-from . import app_settings
-from explorer.utils import (passes_blacklist, swap_params, extract_params, shared_dict_update, get_connection,
-                            get_s3_connection, get_params_for_url)
+from explorer import app_settings
+from explorer.utils import (
+    passes_blacklist,
+    swap_params,
+    extract_params,
+    shared_dict_update,
+    get_s3_bucket,
+    get_params_for_url,
+    get_valid_connection
+)
 
 MSG_FAILED_BLACKLIST = "Query failed the SQL blacklist: %s"
 
@@ -20,10 +31,12 @@ class Query(models.Model):
     title = models.CharField(max_length=255)
     sql = models.TextField()
     description = models.TextField(null=True, blank=True)
-    created_by_user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True)
+    created_by_user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     last_run_date = models.DateTimeField(auto_now=True)
     snapshot = models.BooleanField(default=False, help_text="Include in snapshot task (if enabled)")
+    connection = models.CharField(blank=True, null=True, max_length=128,
+                                  help_text="Name of DB connection (as specified in settings) to use for this query. Will use EXPLORER_DEFAULT_CONNECTION if left blank")
 
     def __init__(self, *args, **kwargs):
         self.params = kwargs.get('params')
@@ -50,7 +63,7 @@ class Query(models.Model):
         return swap_params(self.sql, self.available_params())
 
     def execute_query_only(self):
-        return QueryResult(self.final_sql())
+        return QueryResult(self.final_sql(), get_valid_connection(self.connection))
 
     def execute_with_logging(self, executing_user):
         ql = self.log(executing_user)
@@ -85,9 +98,15 @@ class Query(models.Model):
         return get_params_for_url(self)
 
     def log(self, user=None):
-        if user and user.is_anonymous():
-            user = None
-        ql = QueryLog(sql=self.final_sql(), query_id=self.id, run_by_user=user)
+        if user:
+            # In Django<1.10, is_anonymous was a method.
+            try:
+                is_anonymous = user.is_anonymous()
+            except TypeError:
+                is_anonymous = user.is_anonymous
+            if is_anonymous:
+                user = None
+        ql = QueryLog(sql=self.final_sql(), query_id=self.id, run_by_user=user, connection=self.connection)
         ql.save()
         return ql
 
@@ -98,18 +117,28 @@ class Query(models.Model):
     @property
     def snapshots(self):
         if app_settings.ENABLE_TASKS:
-            conn = get_s3_connection()
-            res = conn.list('query-%s.snap-' % self.id)
-            return sorted(res, key=lambda s: s['last_modified'])
+            b = get_s3_bucket()
+            keys = b.list(prefix='query-%s/snap-' % self.id)
+            keys_s = sorted(keys, key=lambda k: k.last_modified)
+            return [SnapShot(k.generate_url(expires_in=0, query_auth=False),
+                             k.last_modified) for k in keys_s]
+
+
+class SnapShot(object):
+
+    def __init__(self, url, last_modified):
+        self.url = url
+        self.last_modified = last_modified
 
 
 class QueryLog(models.Model):
 
     sql = models.TextField(null=True, blank=True)
     query = models.ForeignKey(Query, null=True, blank=True, on_delete=models.SET_NULL)
-    run_by_user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True)
+    run_by_user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE)
     run_at = models.DateTimeField(auto_now_add=True)
     duration = models.FloatField(blank=True, null=True)  # milliseconds
+    connection = models.CharField(blank=True, null=True, max_length=128)
 
     @property
     def is_playground(self):
@@ -121,9 +150,10 @@ class QueryLog(models.Model):
 
 class QueryResult(object):
 
-    def __init__(self, sql):
+    def __init__(self, sql, connection):
 
         self.sql = sql
+        self.connection = connection
 
         cursor, duration = self.execute_query()
 
@@ -152,9 +182,8 @@ class QueryResult(object):
         return [ColumnHeader(d[0]) for d in self._description] if self._description else [ColumnHeader('--')]
 
     def _get_numerics(self):
-        conn = get_connection()
-        if hasattr(conn.Database, "NUMBER"):
-            return [ix for ix, c in enumerate(self._description) if hasattr(c, 'type_code') and c.type_code in conn.Database.NUMBER.values]
+        if hasattr(self.connection.Database, "NUMBER"):
+            return [ix for ix, c in enumerate(self._description) if hasattr(c, 'type_code') and c.type_code in self.connection.Database.NUMBER.values]
         elif self.data:
             d = self.data[0]
             return [ix for ix, _ in enumerate(self._description) if not isinstance(d[ix], six.string_types) and six.text_type(d[ix]).isnumeric()]
@@ -187,8 +216,7 @@ class QueryResult(object):
                     r[ix] = t.format(str(r[ix]))
 
     def execute_query(self):
-        conn = get_connection()
-        cursor = conn.cursor()
+        cursor = self.connection.cursor()
         start_time = time()
 
         try:
@@ -249,8 +277,7 @@ class ColumnSummary(object):
 
     @property
     def stats(self):
-        # dict comprehensions are not supported in Python 2.6, so do this instead
-        return dict((c.label, c.value) for c in self._stats)
+        return {c.label: c.value for c in self._stats}
 
     def __str__(self):
         return str(self._header)
